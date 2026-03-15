@@ -178,7 +178,7 @@ async function sendTransaction(rpcUrl: string, txBase64: string): Promise<string
 }
 
 async function waitForConfirmation(rpcUrl: string, sig: string): Promise<void> {
-  for (let i = 0; i < 40; i++) {
+  for (let i = 0; i < 120; i++) {
     await new Promise((r) => setTimeout(r, 500));
     const result = await rpcCall<{
       value: Array<{ confirmationStatus: string; err: unknown } | null>;
@@ -461,20 +461,31 @@ async function runGame(payload: CallbackPayload, env: Env): Promise<void> {
     blockhash
   );
 
-  const sig = await sendTransaction(env.SOLANA_RPC_URL, txBase64);
-  await waitForConfirmation(env.SOLANA_RPC_URL, sig);
-  console.log(`[rps] ELO settled — p1: ${newElo1}, p2: ${newElo2} (sig: ${sig})`);
+  let eloSettled = false;
+  try {
+    const sig = await sendTransaction(env.SOLANA_RPC_URL, txBase64);
+    await waitForConfirmation(env.SOLANA_RPC_URL, sig);
+    eloSettled = true;
+    console.log(`[rps] ELO settled — p1: ${newElo1}, p2: ${newElo2} (sig: ${sig})`);
+  } catch (err) {
+    console.error(`[rps] ELO settlement failed — players unblocked anyway:`, err);
+  }
 
-  // ELO confirmed — close the room, players can now re-queue with updated ELO
+  // Always send game_over so players are never left hanging.
+  // eloSettled=false is rare (devnet flakiness, mainnet is ~400ms) but we
+  // unblock the room either way — the queue's active-match KV key is cleared
+  // and players can re-queue. ELO stays at pre-match values on settlement failure.
   ws.send(
     JSON.stringify({
       type: "game_over",
       payload: {
         winner,
-        eloChanges: [
-          { wallet: p1.walletPubkey, delta: delta1, newElo: newElo1 },
-          { wallet: p2.walletPubkey, delta: delta2, newElo: newElo2 },
-        ],
+        eloChanges: eloSettled
+          ? [
+              { wallet: p1.walletPubkey, delta: delta1, newElo: newElo1 },
+              { wallet: p2.walletPubkey, delta: delta2, newElo: newElo2 },
+            ]
+          : [],
       },
     })
   );
