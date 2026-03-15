@@ -197,51 +197,54 @@ async function waitForConfirmation(rpcUrl: string, sig: string): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// update_elo transaction builder
+// update_elo transaction builder — batches N player updates in a single tx
 //
-// Accounts in tx:
-//   [0] game_processor — writable signer
-//   [1] player_pda     — writable non-signer
-//   [2] config_pda     — readonly non-signer
-//   [3] rps_program    — readonly non-signer
+// Account layout (N = number of updates):
+//   [0]       game_processor  — writable signer
+//   [1..N]    player_pda_i    — writable non-signer (one per update)
+//   [N+1]     config_pda      — readonly non-signer
+//   [N+2]     rps_program     — readonly non-signer
 //
-// Header: [1, 0, 2]
+// Header: [1, 0, 2]  (1 signer, 0 readonly signers, 2 readonly unsigned)
 //
-// Instruction accounts (program's [0]=processor, [1]=config_pda, [2]=player_pda):
-//   account indices: [0, 2, 1]
+// Each instruction accounts: processor=0, config_pda=N+1, player_pda_i=1+i
 // ---------------------------------------------------------------------------
 
 async function buildUpdateEloTx(
   processorKeypair: { publicKey: CryptoKey; privateKey: CryptoKey },
   processorPubkeyBytes: Uint8Array,
-  playerPdaBytes: Uint8Array,
+  updates: Array<{ playerPdaBytes: Uint8Array; newElo: number }>,
   configPdaBytes: Uint8Array,
   rpsProgramBytes: Uint8Array,
-  newElo: number,
   recentBlockhash: string
 ): Promise<string> {
   const bhash = b58Decode(recentBlockhash);
-  const sysP = b58Decode("11111111111111111111111111111111");
-  void sysP; // not needed for update_elo but keeping for reference
+  const N = updates.length;
+  const configIndex = 1 + N;
+  const programIndex = 1 + N + 1;
 
-  // Instruction data: [0x02][new_elo u32 LE]
-  const idata = new Uint8Array(5);
-  idata[0] = 0x02;
-  new DataView(idata.buffer).setUint32(1, newElo, true);
+  // Build instructions for all updates
+  const instructions: number[] = [...cu16(N)];
+  for (let i = 0; i < N; i++) {
+    const idata = new Uint8Array(5);
+    idata[0] = 0x02;
+    new DataView(idata.buffer).setUint32(1, updates[i]!.newElo, true);
+    instructions.push(
+      programIndex,
+      ...cu16(3), 0, configIndex, 1 + i, // processor, config_pda, player_pda_i
+      ...cu16(idata.length), ...idata,
+    );
+  }
 
-  // Message: header [1,0,2] + 4 accounts + blockhash + 1 instruction
   const msg = new Uint8Array([
-    1, 0, 2,
-    ...cu16(4),
-    ...processorPubkeyBytes,
-    ...playerPdaBytes,
-    ...configPdaBytes,
-    ...rpsProgramBytes,
+    1, 0, 2,                             // header
+    ...cu16(2 + N),                      // total accounts: processor + N PDAs + config + program
+    ...processorPubkeyBytes,             // [0]
+    ...updates.flatMap(u => [...u.playerPdaBytes]), // [1..N]
+    ...configPdaBytes,                   // [N+1]
+    ...rpsProgramBytes,                  // [N+2]
     ...bhash,
-    ...cu16(1),          // 1 instruction
-    3,                   // program index = 3 (rps_program)
-    ...cu16(3), 0, 2, 1, // account indices: processor=0, config_pda=2, player_pda=1
-    ...cu16(idata.length), ...idata,
+    ...instructions,
   ]);
 
   const sigBytes = new Uint8Array(
@@ -447,33 +450,33 @@ async function runGame(payload: CallbackPayload, env: Env): Promise<void> {
 
   ws.close();
 
-  // Submit on-chain ELO updates
+  // Submit all ELO updates in a single transaction
+  const updates = await Promise.all(
+    ([
+      [p1.walletPubkey, newElo1],
+      [p2.walletPubkey, newElo2],
+    ] as [string, number][]).map(async ([wallet, newElo]) => {
+      const [playerPdaBytes] = await findProgramAddress(
+        [new TextEncoder().encode("player"), b58Decode(wallet)],
+        rpsProgramBytes
+      );
+      return { playerPdaBytes, newElo };
+    })
+  );
+
   const blockhash = await getLatestBlockhash(env.SOLANA_RPC_URL);
+  const txBase64 = await buildUpdateEloTx(
+    processorKeypair,
+    pubkeyBytes,
+    updates,
+    configPdaBytes,
+    rpsProgramBytes,
+    blockhash
+  );
 
-  for (const [wallet, newElo] of [
-    [p1.walletPubkey, newElo1],
-    [p2.walletPubkey, newElo2],
-  ] as [string, number][]) {
-    const walletBytes = b58Decode(wallet);
-    const [playerPdaBytes] = await findProgramAddress(
-      [new TextEncoder().encode("player"), walletBytes],
-      rpsProgramBytes
-    );
-
-    const txBase64 = await buildUpdateEloTx(
-      processorKeypair,
-      pubkeyBytes,
-      playerPdaBytes,
-      configPdaBytes,
-      rpsProgramBytes,
-      newElo,
-      blockhash
-    );
-
-    const sig = await sendTransaction(env.SOLANA_RPC_URL, txBase64);
-    await waitForConfirmation(env.SOLANA_RPC_URL, sig);
-    console.log(`[rps] ELO updated for ${wallet}: ${newElo} (sig: ${sig})`);
-  }
+  const sig = await sendTransaction(env.SOLANA_RPC_URL, txBase64);
+  await waitForConfirmation(env.SOLANA_RPC_URL, sig);
+  console.log(`[rps] ELO updated — p1: ${newElo1}, p2: ${newElo2} (sig: ${sig})`);
 }
 
 // ---------------------------------------------------------------------------
