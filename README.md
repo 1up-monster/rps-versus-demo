@@ -52,6 +52,8 @@ You will need:
 - A Cloudflare account (free tier is fine)
 - A 1upmonster account with a game created (`1up game create "My RPS Game"`)
 
+See [FAQ.md](FAQ.md) for a breakdown of what runs on Solana vs Cloudflare and the trust model.
+
 ## Deploy order
 
 Work through these steps in order. Each one depends on the previous.
