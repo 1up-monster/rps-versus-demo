@@ -210,6 +210,15 @@ async function waitForConfirmation(rpcUrl: string, sig: string): Promise<void> {
 // Each instruction accounts: processor=0, config_pda=N+1, player_pda_i=1+i
 // ---------------------------------------------------------------------------
 
+/** Concatenate Uint8Arrays without spread — avoids workerd spread bugs. */
+function concat(...parts: Uint8Array[]): Uint8Array {
+  const total = parts.reduce((n, p) => n + p.length, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) { out.set(p, off); off += p.length; }
+  return out;
+}
+
 async function buildUpdateEloTx(
   processorKeypair: { publicKey: CryptoKey; privateKey: CryptoKey },
   processorPubkeyBytes: Uint8Array,
@@ -223,36 +232,40 @@ async function buildUpdateEloTx(
   const configIndex = 1 + N;
   const programIndex = 1 + N + 1;
 
-  // Build instructions for all updates
-  const instructions: number[] = [...cu16(N)];
+  // Build each instruction explicitly
+  const ixParts: Uint8Array[] = [new Uint8Array(cu16(N))];
   for (let i = 0; i < N; i++) {
     const idata = new Uint8Array(5);
     idata[0] = 0x02;
     new DataView(idata.buffer).setUint32(1, updates[i]!.newElo, true);
-    instructions.push(
-      programIndex,
-      ...cu16(3), 0, configIndex, 1 + i, // processor, config_pda, player_pda_i
-      ...cu16(idata.length), ...idata,
-    );
+    ixParts.push(new Uint8Array([
+      programIndex,          // program account index
+      ...cu16(3),            // 3 accounts
+      0, configIndex, 1 + i, // processor, config_pda, player_pda_i
+      ...cu16(5),            // 5 bytes of instruction data
+    ]));
+    ixParts.push(idata);
   }
 
-  const msg = new Uint8Array([
-    1, 0, 2,                             // header
-    ...cu16(2 + N),                      // total accounts: processor + N PDAs + config + program
-    ...processorPubkeyBytes,             // [0]
-    ...updates.flatMap(u => [...u.playerPdaBytes]), // [1..N]
-    ...configPdaBytes,                   // [N+1]
-    ...rpsProgramBytes,                  // [N+2]
-    ...bhash,
-    ...instructions,
-  ]);
+  const msg = concat(
+    new Uint8Array([1, 0, 2]),            // header
+    new Uint8Array(cu16(3 + N)),          // account count: processor + N PDAs + config + program
+    processorPubkeyBytes,                 // [0]
+    ...updates.map(u => u.playerPdaBytes),// [1..N]
+    configPdaBytes,                       // [N+1]
+    rpsProgramBytes,                      // [N+2]
+    bhash,                                // recent blockhash
+    ...ixParts,                           // instructions
+  );
 
   const sigBytes = new Uint8Array(
     (await crypto.subtle.sign("Ed25519", processorKeypair.privateKey, msg)) as ArrayBuffer
   );
 
-  const tx = new Uint8Array([...cu16(1), ...sigBytes, ...msg]);
-  return btoa(String.fromCharCode(...tx));
+  const tx = concat(new Uint8Array([1]), sigBytes, msg); // sig count = 1
+  let binary = "";
+  for (const b of tx) binary += String.fromCharCode(b);
+  return btoa(binary);
 }
 
 // ---------------------------------------------------------------------------
@@ -438,37 +451,40 @@ async function runGame(payload: CallbackPayload, env: Env): Promise<void> {
   // Settle ELO on-chain before sending game_over — the open room acts as the
   // natural re-queue lock. Players see the result now; game_over fires once
   // the tx confirms (~400ms on mainnet). No platform-side locks needed.
-  const updates = await Promise.all(
-    ([
-      [p1.walletPubkey, newElo1],
-      [p2.walletPubkey, newElo2],
-    ] as [string, number][]).map(async ([wallet, newElo]) => {
-      const [playerPdaBytes] = await findProgramAddress(
-        [new TextEncoder().encode("player"), b58Decode(wallet)],
-        rpsProgramBytes
-      );
-      return { playerPdaBytes, newElo };
-    })
-  );
-
-  const blockhash = await getLatestBlockhash(env.SOLANA_RPC_URL);
-  const txBase64 = await buildUpdateEloTx(
-    processorKeypair,
-    pubkeyBytes,
-    updates,
-    configPdaBytes,
-    rpsProgramBytes,
-    blockhash
-  );
-
   let eloSettled = false;
   try {
+    const updates = await Promise.all(
+      ([
+        [p1.walletPubkey, newElo1],
+        [p2.walletPubkey, newElo2],
+      ] as [string, number][]).map(async ([wallet, newElo]) => {
+        const [playerPdaBytes] = await findProgramAddress(
+          [new TextEncoder().encode("player"), b58Decode(wallet)],
+          rpsProgramBytes
+        );
+        return { playerPdaBytes, newElo };
+      })
+    );
+
+    const blockhash = await getLatestBlockhash(env.SOLANA_RPC_URL);
+    console.log(`[rps] blockhash: ${blockhash}`);
+
+    const txBase64 = await buildUpdateEloTx(
+      processorKeypair,
+      pubkeyBytes,
+      updates,
+      configPdaBytes,
+      rpsProgramBytes,
+      blockhash
+    );
+
     const sig = await sendTransaction(env.SOLANA_RPC_URL, txBase64);
+    console.log(`[rps] tx submitted: ${sig}`);
     await waitForConfirmation(env.SOLANA_RPC_URL, sig);
     eloSettled = true;
     console.log(`[rps] ELO settled — p1: ${newElo1}, p2: ${newElo2} (sig: ${sig})`);
   } catch (err) {
-    console.error(`[rps] ELO settlement failed — players unblocked anyway:`, err);
+    console.error(`[rps] ELO settlement failed:`, err);
   }
 
   // Always send game_over so players are never left hanging.
