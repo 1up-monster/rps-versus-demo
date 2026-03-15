@@ -5,14 +5,14 @@ Rock Paper Scissors reference implementation for the [1upmonster](https://1up.mo
 Demonstrates the full stack end-to-end:
 
 - **Solana program** (`programs/rps-player`) — Pinocchio `#![no_std]` program that stores per-player ELO on-chain. Only the authorized game processor can update ELO.
-- **Game processor** (`processor/`) — Cloudflare Worker that receives match callbacks, connects to the room as the processor, collects moves from both players, evaluates the winner, and writes updated ELO on-chain.
+- **Game processor** (`processor/`) — game processor (this demo uses a Cloudflare Worker, but any HTTP server works) that receives match callbacks, connects to the room as the processor, collects moves from both players, evaluates the winner, and writes updated ELO on-chain.
 - **Terminal clients** (`client/`) — Node.js CLI that any player runs to queue, accept a match, submit a move, and see the result.
 
 ```
 Player A terminal ──┐
 Player B terminal ──┼──► 1upmonster matchmaking ──► match found
                     │              │
-                    │              └──► POST /callback → rps-processor Worker
+                    │              └──► POST /callback → your game processor
                     │                         │
                     └──────────────────────────┤
                                                ▼
@@ -289,7 +289,7 @@ Account layouts:
 ### Game processor flow
 
 1. 1upmonster sends `POST /callback` with `{ matchId, roomUrl, roomToken, participants }`
-2. Worker returns `200 OK` immediately; game runs in `ctx.waitUntil()`
+2. Processor returns `200 OK` immediately; game runs in `ctx.waitUntil()`
 3. Processor connects WebSocket to room (using `https://` URL with `Upgrade: websocket`)
 4. Sends `initial_game_state` → unlocks player inputs in the room
 5. Collects one valid move (`rock`/`paper`/`scissors`) from each player
