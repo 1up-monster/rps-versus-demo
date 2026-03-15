@@ -32,7 +32,17 @@ This is the most common question, so here's an explicit breakdown.
 
 Correct. The move (`rock`, `paper`, `scissors`) and the match outcome (`player1_wins`, etc.) are never written to Solana. Only the **resulting ELO values** are stored on-chain after the match ends.
 
-This is intentional — writing every game event on-chain would be slow and expensive. The on-chain program is used purely as a **trustworthy scoreboard**: players can independently verify their ELO on Solana Explorer without trusting 1upmonster's database.
+This is intentional for this demo — writing every game event on-chain would be slow and expensive for a simple rock/paper/scissors game. The on-chain program is used purely as a **trustworthy scoreboard**: players can independently verify their ELO on Solana Explorer without trusting 1upmonster's database.
+
+That said, **this is a design choice, not a platform restriction**. If your game requires fully on-chain state — moves, outcomes, everything — you can do that. The platform doesn't dictate what your game processor does with the inputs it receives.
+
+---
+
+## Can I run the entire game on-chain with Magicblock?
+
+Yes. [Magicblock](https://magicblock.gg) provides ephemeral rollups that let you process high-frequency game state on Solana without paying full mainnet fees per move. Your game processor would act as a bridge: it receives player inputs from the 1upmonster room WebSocket, forwards them as transactions to your Magicblock session, and relays the resulting game state updates back to the room.
+
+The 1upmonster platform doesn't know or care what happens inside the processor. From the room's perspective it's the same pattern: players send `game_message`, the processor receives them, the processor sends back `game_state_update` and eventually `game_over`. What the processor does in between — pure in-memory logic, a Magicblock session, a traditional server, anything — is entirely up to you.
 
 ---
 
