@@ -1,0 +1,17 @@
+{
+  "name": "rps-game",
+  "private": true,
+  "packageManager": "pnpm@10.30.3",
+  "scripts": {
+    "build:program": "cargo build-sbf --manifest-path programs/rps-player/Cargo.toml",
+    "deploy:program": "solana program deploy programs/rps-player/target/sbpf-solana-solana/release/rps_player.so",
+    "setup": "npx tsx scripts/setup.ts",
+    "deploy:processor": "pnpm --filter rps-processor deploy",
+    "client": "pnpm --filter rps-client dev"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

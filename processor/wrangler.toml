@@ -1,0 +1,13 @@
+name = "rps-processor"
+main = "src/index.ts"
+compatibility_date = "2024-12-18"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+RPS_PROGRAM_ID = "819bCV5ag9eQ8pV1WRfYRXYokPnNhJYmZT8WcqBYHvTz"
+PLATFORM_API_URL = "https://api.1up.monster"
+
+# Secrets (set via `wrangler secret put`):
+#   PROCESSOR_KEYPAIR   — base58-encoded 64-byte ed25519 keypair
+#   SOLANA_RPC_URL      — Helius devnet RPC: https://devnet.helius-rpc.com/?api-key=<key>
+#   GAME_ID             — 1upmonster game ID this processor serves

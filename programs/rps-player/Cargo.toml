@@ -1,0 +1,15 @@
+[package]
+name = "rps-player"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+pinocchio        = "0.10"
+pinocchio-system = "0.5"
+
+[profile.release]
+opt-level = 3
+overflow-checks = true

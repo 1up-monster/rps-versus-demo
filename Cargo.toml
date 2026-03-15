@@ -1,0 +1,3 @@
+[workspace]
+members = ["programs/rps-player"]
+resolver = "2"
