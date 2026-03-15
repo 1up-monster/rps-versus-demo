@@ -423,7 +423,7 @@ async function runGame(payload: CallbackPayload, env: Env): Promise<void> {
         ? p2.walletPubkey
         : "draw";
 
-  // Send game result to players
+  // Show players the moves + result immediately
   ws.send(
     JSON.stringify({
       type: "game_state_update",
@@ -435,22 +435,9 @@ async function runGame(payload: CallbackPayload, env: Env): Promise<void> {
     })
   );
 
-  ws.send(
-    JSON.stringify({
-      type: "game_over",
-      payload: {
-        winner,
-        eloChanges: [
-          { wallet: p1.walletPubkey, delta: delta1, newElo: newElo1 },
-          { wallet: p2.walletPubkey, delta: delta2, newElo: newElo2 },
-        ],
-      },
-    })
-  );
-
-  ws.close();
-
-  // Submit all ELO updates in a single transaction
+  // Settle ELO on-chain before sending game_over — the open room acts as the
+  // natural re-queue lock. Players see the result now; game_over fires once
+  // the tx confirms (~400ms on mainnet). No platform-side locks needed.
   const updates = await Promise.all(
     ([
       [p1.walletPubkey, newElo1],
@@ -476,7 +463,23 @@ async function runGame(payload: CallbackPayload, env: Env): Promise<void> {
 
   const sig = await sendTransaction(env.SOLANA_RPC_URL, txBase64);
   await waitForConfirmation(env.SOLANA_RPC_URL, sig);
-  console.log(`[rps] ELO updated — p1: ${newElo1}, p2: ${newElo2} (sig: ${sig})`);
+  console.log(`[rps] ELO settled — p1: ${newElo1}, p2: ${newElo2} (sig: ${sig})`);
+
+  // ELO confirmed — close the room, players can now re-queue with updated ELO
+  ws.send(
+    JSON.stringify({
+      type: "game_over",
+      payload: {
+        winner,
+        eloChanges: [
+          { wallet: p1.walletPubkey, delta: delta1, newElo: newElo1 },
+          { wallet: p2.walletPubkey, delta: delta2, newElo: newElo2 },
+        ],
+      },
+    })
+  );
+
+  ws.close();
 }
 
 // ---------------------------------------------------------------------------
