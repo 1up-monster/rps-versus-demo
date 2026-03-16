@@ -383,6 +383,10 @@ export class GameProcessor implements DurableObject {
         () => resolve(null),
         Math.max(0, payload.expiresAt - Date.now())
       );
+      // Keep the Room DO heartbeat alive — without pings the processor socket is
+      // pruned after 12s of inactivity (HEARTBEAT_TIMEOUT_MS in room.ts).
+      const ping = setInterval(() => ws.send(JSON.stringify({ type: "ping" })), 8000);
+      const cleanup = () => { clearInterval(ping); clearTimeout(deadline); };
       ws.addEventListener("message", (e: MessageEvent) => {
         try {
           const msg = JSON.parse(e.data as string) as {
@@ -398,7 +402,7 @@ export class GameProcessor implements DurableObject {
             ) {
               moveMap.set(from, data.move);
               if (moveMap.size === 2) {
-                clearTimeout(deadline);
+                cleanup();
                 resolve(moveMap);
               }
             }
@@ -407,8 +411,8 @@ export class GameProcessor implements DurableObject {
           // ignore parse errors
         }
       });
-      ws.addEventListener("close", () => { clearTimeout(deadline); resolve(null); });
-      ws.addEventListener("error", () => { clearTimeout(deadline); resolve(null); });
+      ws.addEventListener("close", () => { cleanup(); resolve(null); });
+      ws.addEventListener("error", () => { cleanup(); resolve(null); });
     });
 
     if (!moves) {

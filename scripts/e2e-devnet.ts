@@ -35,6 +35,10 @@ const RPS_PROG  = "819bCV5ag9eQ8pV1WRfYRXYokPnNhJYmZT8WcqBYHvTz";
 const KP1_PATH = join(homedir(), ".config", "solana", "id.json");
 const KP2_PATH = join(homedir(), ".config", "solana", "id2.json");
 
+// Move delay — simulates player think time. Set via --delay <seconds> arg.
+const delayArg = process.argv.indexOf("--delay");
+const MOVE_DELAY_MS = delayArg !== -1 ? parseInt(process.argv[delayArg + 1]!) * 1000 : 0;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -72,6 +76,7 @@ async function runPlayer(
   label: string,
   kp: Keypair,
   move: string,
+  moveDelayMs = 0,
 ): Promise<{ winner: string; eloChanges: Array<{ wallet: string; delta: number; newElo: number }> }> {
 
   const auth = new AuthClient(API_URL);
@@ -100,11 +105,21 @@ async function runPlayer(
 
     // Listen for initial_game_state — processor fires this to unlock inputs
     r.on("initial_game_state", () => {
-      console.log(`[${label}] initial_game_state received → sending ${move.toUpperCase()}`);
-      room.broadcast({ move });
+      const jitter = Math.floor(Math.random() * 2000);
+      const wait = moveDelayMs + jitter;
+      if (wait > 0) {
+        console.log(`[${label}] initial_game_state received → waiting ${(wait / 1000).toFixed(1)}s before sending ${move.toUpperCase()}`);
+      } else {
+        console.log(`[${label}] initial_game_state received → sending ${move.toUpperCase()}`);
+      }
+      setTimeout(() => {
+        moveSent = true;
+        clearTimeout(fallback);
+        room.broadcast({ move });
+      }, wait);
     });
 
-    // Fallback: send move 3s after accept in case we missed initial_game_state
+    // Fallback: send move after delay + buffer in case we missed initial_game_state
     let moveSent = false;
     const fallback = setTimeout(() => {
       if (!moveSent) {
@@ -112,7 +127,7 @@ async function runPlayer(
         console.log(`[${label}] fallback: sending ${move.toUpperCase()}`);
         room.broadcast({ move });
       }
-    }, 3000);
+    }, moveDelayMs + 5000);
 
     r.on("game_state_update", (payload: unknown) => {
       moveSent = true;
@@ -157,9 +172,10 @@ async function main(): Promise<void> {
   console.log(`ELO before — P1: ${elo1Before ?? "none"}, P2: ${elo2Before ?? "none"}\n`);
 
   // Run both players concurrently — P1 plays "rock", P2 plays "scissors"
+  if (MOVE_DELAY_MS > 0) console.log(`Move delay: ${MOVE_DELAY_MS / 1000}s (+up to 2s jitter per player)\n`);
   const [result1] = await Promise.all([
-    runPlayer("P1", kp1, "rock"),
-    runPlayer("P2", kp2, "scissors"),
+    runPlayer("P1", kp1, "rock", MOVE_DELAY_MS),
+    runPlayer("P2", kp2, "scissors", MOVE_DELAY_MS),
   ]);
 
   // Both game_over payloads are identical — use result1
