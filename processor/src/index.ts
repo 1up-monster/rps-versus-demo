@@ -20,7 +20,6 @@ interface Env {
   PLATFORM_API_URL: string;
   GAME_ID: string;
   GAME_PROCESSOR: DurableObjectNamespace;
-  MATCH_ROOM: DurableObjectNamespace;
 }
 
 interface CallbackPayload {
@@ -366,18 +365,12 @@ export class GameProcessor implements DurableObject {
     }
     const [p1, p2] = players as [typeof players[0], typeof players[0]];
 
-    // 1. Connect to Room DO via WebSocket using MATCH_ROOM service binding
-    const roomStub = this.env.MATCH_ROOM.get(this.env.MATCH_ROOM.idFromName(payload.matchId));
-    const wsResp = await roomStub.fetch(new Request("https://internal/", {
-      headers: {
-        "Upgrade": "websocket",
-        "Connection": "Upgrade",
-        "X-Verified-Wallet": processorPubkey,
-        "X-Match-Id": payload.matchId,
-        "X-Participant-Role": "processor",
-      },
-    }));
-    const ws = wsResp.webSocket;
+    // 1. Connect to Room via the platform's public WebSocket endpoint using the
+    //    processor room token issued in the match callback. Any 3rd party processor
+    //    does the same — no service binding or platform internals required.
+    const wsUrl = payload.roomUrl + `?token=${encodeURIComponent(payload.roomToken)}`;
+    const wsResp = await fetch(wsUrl, { headers: { Upgrade: "websocket" } });
+    const ws = (wsResp as unknown as { webSocket: WebSocket | null }).webSocket;
     if (!ws) {
       console.error("[rps] no webSocket in response");
       await this.state.storage.deleteAll();
@@ -507,19 +500,13 @@ export class GameProcessor implements DurableObject {
     );
 
     // Reconnect to Room and send game_over
+    const payload = await this.state.storage.get<CallbackPayload>("payload");
     try {
-      const processorPubkey = b58Encode(pubkeyBytes);
-      const roomStub = this.env.MATCH_ROOM.get(this.env.MATCH_ROOM.idFromName(pending.matchId));
-      const wsResp = await roomStub.fetch(new Request("https://internal/", {
-        headers: {
-          "Upgrade": "websocket",
-          "Connection": "Upgrade",
-          "X-Verified-Wallet": processorPubkey,
-          "X-Match-Id": pending.matchId,
-          "X-Participant-Role": "processor",
-        },
-      }));
-      const ws = wsResp.webSocket;
+      const wsUrl = payload
+        ? payload.roomUrl + `?token=${encodeURIComponent(payload.roomToken)}`
+        : null;
+      const wsResp = wsUrl ? await fetch(wsUrl, { headers: { Upgrade: "websocket" } }) : null;
+      const ws = wsResp ? (wsResp as unknown as { webSocket: WebSocket | null }).webSocket : null;
       if (ws) {
         ws.accept();
         // Re-initialize processor slot so Room accepts our messages
