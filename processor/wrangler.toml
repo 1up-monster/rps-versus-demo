@@ -11,8 +11,17 @@ PLATFORM_API_URL = "https://api.1up.monster"
 name = "GAME_PROCESSOR"
 class_name = "GameProcessor"
 
+[[durable_objects.bindings]]
+name = "MATCH_ROOM"
+class_name = "MatchRoom"
+script_name = "1upmonster-api"
+
 [[migrations]]
-tag = "v1"
+tag = "v2"
+deleted_classes = ["GameProcessor"]
+
+[[migrations]]
+tag = "v3"
 new_sqlite_classes = ["GameProcessor"]
 
 # Secrets (set via `wrangler secret put`):

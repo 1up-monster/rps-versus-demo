@@ -2,8 +2,8 @@
  * RPS Game Processor — Cloudflare Worker
  *
  * Receives match callbacks from 1upmonster, connects to the room as the game
- * processor, collects rock/paper/scissors moves from both players, evaluates
- * the winner, and updates ELO on-chain via the rps-player Solana program.
+ * processor via WebSocket, collects rock/paper/scissors moves from both players,
+ * evaluates the winner, and updates ELO on-chain via the rps-player Solana program.
  *
  * Env (wrangler.toml vars + secrets):
  *   PROCESSOR_KEYPAIR  — base58-encoded 64-byte ed25519 keypair (secret)
@@ -20,6 +20,7 @@ interface Env {
   PLATFORM_API_URL: string;
   GAME_ID: string;
   GAME_PROCESSOR: DurableObjectNamespace;
+  MATCH_ROOM: DurableObjectNamespace;
 }
 
 interface CallbackPayload {
@@ -28,6 +29,17 @@ interface CallbackPayload {
   roomToken: string;
   participants: Array<{ walletPubkey: string; role: string; teamIndex?: number }>;
   expiresAt: number;
+}
+
+interface PendingElo {
+  matchId: string;
+  winner: string;
+  p1: string;
+  p2: string;
+  delta1: number;
+  delta2: number;
+  newElo1: number;
+  newElo2: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -312,188 +324,157 @@ function evaluateRPS(
 }
 
 // ---------------------------------------------------------------------------
-// Game loop
+// GameProcessor Durable Object
+//
+// Receives the match callback, connects to the Room DO via WebSocket, sends
+// initial_game_state to unlock player inputs, collects moves, and settles ELO
+// on-chain. An alarm fires 60s after ELO settlement begins as a retry safety
+// net in case the DO is evicted mid-settlement.
 // ---------------------------------------------------------------------------
 
-async function runGame(payload: CallbackPayload, env: Env): Promise<void> {
-  const { roomUrl, roomToken, participants } = payload;
+export class GameProcessor implements DurableObject {
+  constructor(private state: DurableObjectState, private env: Env) {}
 
-  // Load processor keypair
-  const keypairBytes = b58Decode(env.PROCESSOR_KEYPAIR);
-  const secretSeed = keypairBytes.slice(0, 32);
-  const pubkeyBytes = keypairBytes.slice(32, 64);
-  // Ed25519 private key must be wrapped in PKCS8 DER for subtle.importKey
-  const pkcs8 = new Uint8Array([
-    0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70,
-    0x04, 0x22, 0x04, 0x20,
-    ...secretSeed,
-  ]);
-  const privateKey = await crypto.subtle.importKey("pkcs8", pkcs8, "Ed25519", false, ["sign"]);
-  const publicKey = await crypto.subtle.importKey("raw", pubkeyBytes, "Ed25519", true, ["verify"]);
-  const processorKeypair = { privateKey, publicKey };
+  async fetch(request: Request): Promise<Response> {
+    const body = await request.text();
 
-  // Compute program address bytes
-  const rpsProgramBytes = b58Decode(env.RPS_PROGRAM_ID);
+    // Dedup: ignore duplicate callbacks for the same match
+    let started = false;
+    await this.state.blockConcurrencyWhile(async () => {
+      started = (await this.state.storage.get<boolean>("started")) ?? false;
+      if (!started) await this.state.storage.put("started", true);
+    });
+    if (started) {
+      console.log(`[rps] Duplicate callback ignored`);
+      return new Response("OK", { status: 200 });
+    }
 
-  // Derive config PDA
-  const [configPdaBytes] = await findProgramAddress(
-    [new TextEncoder().encode("config")],
-    rpsProgramBytes
-  );
-
-  // Connect to room WebSocket as processor
-  // Cloudflare Workers fetch() requires https:// (not wss://) for WebSocket upgrades
-  const wsUrl = roomUrl + `?token=${encodeURIComponent(roomToken)}`;
-  const resp = await fetch(wsUrl, {
-    headers: { Upgrade: "websocket" },
-  });
-  if (resp.status !== 101) {
-    throw new Error(`Failed to connect to room: HTTP ${resp.status}`);
+    const payload = JSON.parse(body) as CallbackPayload;
+    await this.state.storage.put("payload", payload);
+    this.state.waitUntil(this.runGame(payload));
+    return new Response("OK", { status: 200 });
   }
-  const ws = (resp as unknown as { webSocket: WebSocket }).webSocket;
-  ws.accept();
 
-  // Send initial_game_state to unlock player inputs
-  ws.send(JSON.stringify({ type: "initial_game_state", payload: { round: 1 } }));
+  private async runGame(payload: CallbackPayload): Promise<void> {
+    const pubkeyBytes = b58Decode(this.env.PROCESSOR_KEYPAIR).slice(32, 64);
+    const processorPubkey = b58Encode(pubkeyBytes);
+    const players = payload.participants.filter((p) => p.role === "player");
+    if (players.length !== 2) {
+      console.error(`[rps] expected 2 players, got ${players.length}`);
+      await this.state.storage.deleteAll();
+      return;
+    }
+    const [p1, p2] = players as [typeof players[0], typeof players[0]];
 
-  // Collect one move from each player (first valid move wins, ignores duplicates)
-  const players = participants.filter((p) => p.role === "player");
-  if (players.length !== 2) {
-    ws.close();
-    throw new Error(`Expected 2 players, got ${players.length}`);
-  }
-  const [p1, p2] = players as [typeof players[0], typeof players[0]];
-  const moves = new Map<string, string>();
+    // 1. Connect to Room DO via WebSocket using MATCH_ROOM service binding
+    const roomStub = this.env.MATCH_ROOM.get(this.env.MATCH_ROOM.idFromName(payload.matchId));
+    const wsResp = await roomStub.fetch(new Request("https://internal/", {
+      headers: {
+        "Upgrade": "websocket",
+        "Connection": "Upgrade",
+        "X-Verified-Wallet": processorPubkey,
+        "X-Match-Id": payload.matchId,
+        "X-Participant-Role": "processor",
+      },
+    }));
+    const ws = wsResp.webSocket;
+    if (!ws) {
+      console.error("[rps] no webSocket in response");
+      await this.state.storage.deleteAll();
+      return;
+    }
+    ws.accept();
 
-  await new Promise<void>((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      ws.close();
-      reject(new Error("Timeout waiting for player moves"));
-    }, 60_000);
+    // 2. Send initial_game_state to unlock player inputs
+    ws.send(JSON.stringify({ type: "initial_game_state", payload: { round: 1 } }));
 
-    ws.addEventListener("message", (e: MessageEvent) => {
-      try {
-        const msg = JSON.parse(e.data as string) as {
-          type: string;
-          payload?: { from: string; data: { move: string } };
-        };
-        if (msg.type === "game_message" && msg.payload) {
-          const { from, data } = msg.payload;
-          if (
-            !moves.has(from) &&
-            players.some((p) => p.walletPubkey === from) &&
-            ["rock", "paper", "scissors"].includes(data?.move)
-          ) {
-            moves.set(from, data.move);
+    // 3. Collect player moves (with timeout at expiresAt)
+    const moves = await new Promise<Map<string, string> | null>((resolve) => {
+      const moveMap = new Map<string, string>();
+      const deadline = setTimeout(
+        () => resolve(null),
+        Math.max(0, payload.expiresAt - Date.now())
+      );
+      ws.addEventListener("message", (e: MessageEvent) => {
+        try {
+          const msg = JSON.parse(e.data as string) as {
+            type: string;
+            payload?: { from: string; data: { move: string } };
+          };
+          if (msg.type === "game_message" && msg.payload) {
+            const { from, data } = msg.payload;
+            if (
+              !moveMap.has(from) &&
+              players.some((p) => p.walletPubkey === from) &&
+              ["rock", "paper", "scissors"].includes(data?.move)
+            ) {
+              moveMap.set(from, data.move);
+              if (moveMap.size === 2) {
+                clearTimeout(deadline);
+                resolve(moveMap);
+              }
+            }
           }
+        } catch {
+          // ignore parse errors
         }
-      } catch {
-        // ignore parse errors
-      }
-      if (moves.size === 2) {
-        clearTimeout(timeout);
-        resolve();
-      }
+      });
+      ws.addEventListener("close", () => { clearTimeout(deadline); resolve(null); });
+      ws.addEventListener("error", () => { clearTimeout(deadline); resolve(null); });
     });
 
-    ws.addEventListener("close", () => {
-      clearTimeout(timeout);
-      reject(new Error("Room WebSocket closed before both moves received"));
-    });
-  });
+    if (!moves) {
+      console.log(`[rps] no moves received (timeout or disconnect), closing`);
+      ws.close();
+      await this.state.storage.deleteAll();
+      return;
+    }
 
-  const move1 = moves.get(p1.walletPubkey)!;
-  const move2 = moves.get(p2.walletPubkey)!;
-  const result = evaluateRPS(move1, move2);
+    // 4. Compute result
+    const move1 = moves.get(p1.walletPubkey)!;
+    const move2 = moves.get(p2.walletPubkey)!;
+    const rpsResult = evaluateRPS(move1, move2);
+    const winner =
+      rpsResult === "player1_wins" ? p1.walletPubkey
+      : rpsResult === "player2_wins" ? p2.walletPubkey
+      : "draw";
 
-  // Fetch current ELO for both players from Solana
-  async function getPlayerElo(walletB58: string): Promise<number> {
-    const walletBytes = b58Decode(walletB58);
-    const [pdaBytes] = await findProgramAddress(
-      [new TextEncoder().encode("player"), walletBytes],
-      rpsProgramBytes
-    );
-    const pdaAddress = b58Encode(pdaBytes);
-    const info = await rpcCall<{ value: { data: [string, string] } | null }>(
-      env.SOLANA_RPC_URL,
-      "getAccountInfo",
-      [pdaAddress, { encoding: "base64", commitment: "confirmed" }]
-    );
-    if (!info.value) return 1000; // default if not initialized
-    const data = Uint8Array.from(atob(info.value.data[0]), (c) => c.charCodeAt(0));
-    return new DataView(data.buffer).getUint32(0, true);
-  }
+    const elo1 = await this.getPlayerElo(p1.walletPubkey);
+    const elo2 = await this.getPlayerElo(p2.walletPubkey);
+    const [delta1, delta2] = computeEloChanges(elo1, elo2, rpsResult);
+    const newElo1 = Math.max(0, elo1 + delta1);
+    const newElo2 = Math.max(0, elo2 + delta2);
 
-  const elo1 = await getPlayerElo(p1.walletPubkey);
-  const elo2 = await getPlayerElo(p2.walletPubkey);
-  const [delta1, delta2] = computeEloChanges(elo1, elo2, result);
-  const newElo1 = Math.max(0, elo1 + delta1);
-  const newElo2 = Math.max(0, elo2 + delta2);
-
-  const winner =
-    result === "player1_wins"
-      ? p1.walletPubkey
-      : result === "player2_wins"
-        ? p2.walletPubkey
-        : "draw";
-
-  // Show players the moves + result immediately
-  ws.send(
-    JSON.stringify({
+    // 5. Broadcast moves reveal
+    ws.send(JSON.stringify({
       type: "game_state_update",
       payload: {
         seqId: 1,
         moves: { [p1.walletPubkey]: move1, [p2.walletPubkey]: move2 },
-        result,
+        result: rpsResult,
       },
-    })
-  );
+    }));
 
-  // Settle ELO on-chain before sending game_over — the open room acts as the
-  // natural re-queue lock. Players see the result now; game_over fires once
-  // the tx confirms (~400ms on mainnet). No platform-side locks needed.
-  let eloSettled = false;
-  try {
-    const updates = await Promise.all(
-      ([
-        [p1.walletPubkey, newElo1],
-        [p2.walletPubkey, newElo2],
-      ] as [string, number][]).map(async ([wallet, newElo]) => {
-        const [playerPdaBytes] = await findProgramAddress(
-          [new TextEncoder().encode("player"), b58Decode(wallet)],
-          rpsProgramBytes
-        );
-        return { playerPdaBytes, newElo };
-      })
-    );
+    // 6. Persist result + set alarm BEFORE on-chain settlement
+    // (alarm retries ELO + sends game_over if DO is evicted during settlement)
+    const eloPayload: PendingElo = {
+      matchId: payload.matchId,
+      winner,
+      p1: p1.walletPubkey,
+      p2: p2.walletPubkey,
+      delta1,
+      delta2,
+      newElo1,
+      newElo2,
+    };
+    await this.state.storage.put("pendingElo", eloPayload);
+    await this.state.storage.setAlarm(Date.now() + 60_000);
 
-    const blockhash = await getLatestBlockhash(env.SOLANA_RPC_URL);
-    console.log(`[rps] blockhash: ${blockhash}`);
+    // 7. Settle ELO on-chain
+    const eloSettled = await this.settleElo(pubkeyBytes, p1.walletPubkey, p2.walletPubkey, newElo1, newElo2);
 
-    const txBase64 = await buildUpdateEloTx(
-      processorKeypair,
-      pubkeyBytes,
-      updates,
-      configPdaBytes,
-      rpsProgramBytes,
-      blockhash
-    );
-
-    const sig = await sendTransaction(env.SOLANA_RPC_URL, txBase64);
-    console.log(`[rps] tx submitted: ${sig}`);
-    await waitForConfirmation(env.SOLANA_RPC_URL, sig);
-    eloSettled = true;
-    console.log(`[rps] ELO settled — p1: ${newElo1}, p2: ${newElo2} (sig: ${sig})`);
-  } catch (err) {
-    console.error(`[rps] ELO settlement failed:`, err);
-  }
-
-  // Always send game_over so players are never left hanging.
-  // eloSettled=false is rare (devnet flakiness, mainnet is ~400ms) but we
-  // unblock the room either way — the queue's active-match KV key is cleared
-  // and players can re-queue. ELO stays at pre-match values on settlement failure.
-  ws.send(
-    JSON.stringify({
+    // 8. Send game_over via WS
+    ws.send(JSON.stringify({
       type: "game_over",
       payload: {
         winner,
@@ -504,36 +485,143 @@ async function runGame(payload: CallbackPayload, env: Env): Promise<void> {
             ]
           : [],
       },
-    })
-  );
+    }));
+    ws.close();
+    console.log(`[rps] game_over sent winner=${winner} eloSettled=${eloSettled}`);
 
-  ws.close();
-}
+    if (eloSettled) await this.state.storage.deleteAll(); // also cancels alarm
+  }
 
-// ---------------------------------------------------------------------------
-// GameProcessor Durable Object
-//
-// Each match gets its own DO instance (keyed by matchId). Running runGame
-// inside a DO's waitUntil + active outbound WebSocket keeps the DO alive for
-// the full game duration — no CPU wall-clock limit like a stateless Worker.
-// ---------------------------------------------------------------------------
+  async alarm(): Promise<void> {
+    // ELO settlement retry — fires if DO was evicted during on-chain settlement
+    const pending = await this.state.storage.get<PendingElo>("pendingElo");
+    if (!pending) return;
 
-export class GameProcessor implements DurableObject {
-  constructor(private state: DurableObjectState, private env: Env) {}
-
-  async fetch(request: Request): Promise<Response> {
-    const payload = (await request.json()) as CallbackPayload;
-    this.state.waitUntil(
-      runGame(payload, this.env).catch((err: unknown) => {
-        console.error(`[rps] Game error for match ${payload.matchId}:`, err);
-      })
+    const pubkeyBytes = b58Decode(this.env.PROCESSOR_KEYPAIR).slice(32, 64);
+    const eloSettled = await this.settleElo(
+      pubkeyBytes,
+      pending.p1,
+      pending.p2,
+      pending.newElo1,
+      pending.newElo2
     );
-    return new Response("OK", { status: 200 });
+
+    // Reconnect to Room and send game_over
+    try {
+      const processorPubkey = b58Encode(pubkeyBytes);
+      const roomStub = this.env.MATCH_ROOM.get(this.env.MATCH_ROOM.idFromName(pending.matchId));
+      const wsResp = await roomStub.fetch(new Request("https://internal/", {
+        headers: {
+          "Upgrade": "websocket",
+          "Connection": "Upgrade",
+          "X-Verified-Wallet": processorPubkey,
+          "X-Match-Id": pending.matchId,
+          "X-Participant-Role": "processor",
+        },
+      }));
+      const ws = wsResp.webSocket;
+      if (ws) {
+        ws.accept();
+        // Re-initialize processor slot so Room accepts our messages
+        ws.send(JSON.stringify({ type: "initial_game_state", payload: {} }));
+        ws.send(JSON.stringify({
+          type: "game_over",
+          payload: {
+            winner: pending.winner,
+            eloChanges: eloSettled
+              ? [
+                  { wallet: pending.p1, delta: pending.delta1, newElo: pending.newElo1 },
+                  { wallet: pending.p2, delta: pending.delta2, newElo: pending.newElo2 },
+                ]
+              : [],
+          },
+        }));
+        ws.close();
+        console.log(`[rps] alarm: game_over sent via WS retry eloSettled=${eloSettled}`);
+      }
+    } catch (err) {
+      console.error("[rps] alarm: failed to send game_over:", err);
+    }
+
+    await this.state.storage.deleteAll();
+  }
+
+  private async settleElo(
+    pubkeyBytes: Uint8Array,
+    p1: string,
+    p2: string,
+    newElo1: number,
+    newElo2: number
+  ): Promise<boolean> {
+    try {
+      const rpsProgramBytes = b58Decode(this.env.RPS_PROGRAM_ID);
+      const [configPdaBytes] = await findProgramAddress(
+        [new TextEncoder().encode("config")],
+        rpsProgramBytes
+      );
+
+      const secretSeed = b58Decode(this.env.PROCESSOR_KEYPAIR).slice(0, 32);
+      const pkcs8 = new Uint8Array([
+        0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70,
+        0x04, 0x22, 0x04, 0x20, ...secretSeed,
+      ]);
+      const privateKey = await crypto.subtle.importKey("pkcs8", pkcs8, "Ed25519", false, ["sign"]);
+      const publicKey = await crypto.subtle.importKey("raw", pubkeyBytes, "Ed25519", true, ["verify"]);
+      const processorKeypair = { privateKey, publicKey };
+
+      const updates = await Promise.all(
+        ([
+          [p1, newElo1],
+          [p2, newElo2],
+        ] as [string, number][]).map(async ([wallet, newElo]) => {
+          const [playerPdaBytes] = await findProgramAddress(
+            [new TextEncoder().encode("player"), b58Decode(wallet)],
+            rpsProgramBytes
+          );
+          return { playerPdaBytes, newElo };
+        })
+      );
+
+      const blockhash = await getLatestBlockhash(this.env.SOLANA_RPC_URL);
+      const txBase64 = await buildUpdateEloTx(
+        processorKeypair,
+        pubkeyBytes,
+        updates,
+        configPdaBytes,
+        rpsProgramBytes,
+        blockhash
+      );
+      const sig = await sendTransaction(this.env.SOLANA_RPC_URL, txBase64);
+      console.log(`[rps] tx submitted: ${sig}`);
+      await waitForConfirmation(this.env.SOLANA_RPC_URL, sig);
+      console.log(`[rps] ELO settled — p1: ${newElo1}, p2: ${newElo2} (sig: ${sig})`);
+      return true;
+    } catch (err) {
+      console.error(`[rps] ELO settlement failed:`, err);
+      return false;
+    }
+  }
+
+  private async getPlayerElo(walletB58: string): Promise<number> {
+    const rpsProgramBytes = b58Decode(this.env.RPS_PROGRAM_ID);
+    const walletBytes = b58Decode(walletB58);
+    const [pdaBytes] = await findProgramAddress(
+      [new TextEncoder().encode("player"), walletBytes],
+      rpsProgramBytes
+    );
+    const info = await rpcCall<{ value: { data: [string, string] } | null }>(
+      this.env.SOLANA_RPC_URL,
+      "getAccountInfo",
+      [b58Encode(pdaBytes), { encoding: "base64", commitment: "confirmed" }]
+    );
+    if (!info.value) return 1000;
+    const buf = Uint8Array.from(atob(info.value.data[0]), (c) => c.charCodeAt(0));
+    return new DataView(buf.buffer).getUint32(0, true);
   }
 }
 
 // ---------------------------------------------------------------------------
-// Worker fetch handler
+// Worker fetch handler — forwards callback to a per-match DO instance
 // ---------------------------------------------------------------------------
 
 export default {
@@ -553,8 +641,6 @@ export default {
         return new Response("Missing required fields", { status: 400 });
       }
 
-      // Route to a per-match DO instance — Worker's waitUntil only lasts ~100ms
-      // (just long enough to call the DO). The DO's own waitUntil runs the full game.
       const id = env.GAME_PROCESSOR.idFromName(payload.matchId);
       const stub = env.GAME_PROCESSOR.get(id);
       ctx.waitUntil(stub.fetch(new Request(request.url, { method: "POST", body })));
