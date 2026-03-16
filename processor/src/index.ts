@@ -324,11 +324,6 @@ function evaluateRPS(
 
 // ---------------------------------------------------------------------------
 // GameProcessor Durable Object
-//
-// Receives the match callback, connects to the Room DO via WebSocket, sends
-// initial_game_state to unlock player inputs, collects moves, and settles ELO
-// on-chain. An alarm fires 60s after ELO settlement begins as a retry safety
-// net in case the DO is evicted mid-settlement.
 // ---------------------------------------------------------------------------
 
 export class GameProcessor implements DurableObject {
@@ -448,8 +443,7 @@ export class GameProcessor implements DurableObject {
       },
     }));
 
-    // 6. Persist result + set alarm BEFORE on-chain settlement
-    // (alarm retries ELO + sends game_over if DO is evicted during settlement)
+    // 6. Persist result + set alarm before on-chain settlement
     const eloPayload: PendingElo = {
       matchId: payload.matchId,
       winner,
@@ -482,11 +476,11 @@ export class GameProcessor implements DurableObject {
     ws.close();
     console.log(`[rps] game_over sent winner=${winner} eloSettled=${eloSettled}`);
 
-    if (eloSettled) await this.state.storage.deleteAll(); // also cancels alarm
+    if (eloSettled) await this.state.storage.deleteAll();
   }
 
   async alarm(): Promise<void> {
-    // ELO settlement retry — fires if DO was evicted during on-chain settlement
+    // Retry ELO settlement and send game_over if interrupted
     const pending = await this.state.storage.get<PendingElo>("pendingElo");
     if (!pending) return;
 
@@ -509,7 +503,6 @@ export class GameProcessor implements DurableObject {
       const ws = wsResp ? (wsResp as unknown as { webSocket: WebSocket | null }).webSocket : null;
       if (ws) {
         ws.accept();
-        // Re-initialize processor slot so Room accepts our messages
         ws.send(JSON.stringify({ type: "initial_game_state", payload: {} }));
         ws.send(JSON.stringify({
           type: "game_over",
