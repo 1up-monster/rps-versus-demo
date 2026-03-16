@@ -7,6 +7,14 @@ compatibility_flags = ["nodejs_compat"]
 RPS_PROGRAM_ID = "819bCV5ag9eQ8pV1WRfYRXYokPnNhJYmZT8WcqBYHvTz"
 PLATFORM_API_URL = "https://api.1up.monster"
 
+[[durable_objects.bindings]]
+name = "GAME_PROCESSOR"
+class_name = "GameProcessor"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["GameProcessor"]
+
 # Secrets (set via `wrangler secret put`):
 #   PROCESSOR_KEYPAIR   — base58-encoded 64-byte ed25519 keypair
 #   SOLANA_RPC_URL      — Helius devnet RPC: https://devnet.helius-rpc.com/?api-key=<key>

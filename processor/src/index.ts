@@ -19,6 +19,7 @@ interface Env {
   RPS_PROGRAM_ID: string;
   PLATFORM_API_URL: string;
   GAME_ID: string;
+  GAME_PROCESSOR: DurableObjectNamespace;
 }
 
 interface CallbackPayload {
@@ -510,6 +511,28 @@ async function runGame(payload: CallbackPayload, env: Env): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// GameProcessor Durable Object
+//
+// Each match gets its own DO instance (keyed by matchId). Running runGame
+// inside a DO's waitUntil + active outbound WebSocket keeps the DO alive for
+// the full game duration — no CPU wall-clock limit like a stateless Worker.
+// ---------------------------------------------------------------------------
+
+export class GameProcessor implements DurableObject {
+  constructor(private state: DurableObjectState, private env: Env) {}
+
+  async fetch(request: Request): Promise<Response> {
+    const payload = (await request.json()) as CallbackPayload;
+    this.state.waitUntil(
+      runGame(payload, this.env).catch((err: unknown) => {
+        console.error(`[rps] Game error for match ${payload.matchId}:`, err);
+      })
+    );
+    return new Response("OK", { status: 200 });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Worker fetch handler
 // ---------------------------------------------------------------------------
 
@@ -519,23 +542,22 @@ export default {
 
     if (request.method === "POST" && url.pathname === "/callback") {
       let payload: CallbackPayload;
+      const body = await request.text();
       try {
-        payload = (await request.json()) as CallbackPayload;
+        payload = JSON.parse(body) as CallbackPayload;
       } catch {
         return new Response("Invalid JSON", { status: 400 });
       }
 
-      // Validate required fields
       if (!payload.matchId || !payload.roomUrl || !payload.roomToken) {
         return new Response("Missing required fields", { status: 400 });
       }
 
-      // Return 200 immediately — game runs asynchronously
-      ctx.waitUntil(
-        runGame(payload, env).catch((err: unknown) => {
-          console.error(`[rps] Game error for match ${payload.matchId}:`, err);
-        })
-      );
+      // Route to a per-match DO instance — Worker's waitUntil only lasts ~100ms
+      // (just long enough to call the DO). The DO's own waitUntil runs the full game.
+      const id = env.GAME_PROCESSOR.idFromName(payload.matchId);
+      const stub = env.GAME_PROCESSOR.get(id);
+      ctx.waitUntil(stub.fetch(new Request(request.url, { method: "POST", body })));
 
       return new Response("OK", { status: 200 });
     }
